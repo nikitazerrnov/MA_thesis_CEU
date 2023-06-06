@@ -1,0 +1,497 @@
+---
+title: "Sidoov MA Thesis Script"
+output: html_document
+date: "2023-05-16"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r}
+pacman::p_load(
+  readxl,
+  tidyverse,
+  udpipe,
+  tidytext,
+  stringr,
+  stopwords,
+  gridExtra,
+  grid,
+  igraph,
+  ggraph,
+  bigrquery,
+  textstem,
+  wordnet,
+  pbapply,
+  rstatix
+)
+
+set.seed(1111)
+
+load("~/Documents/R/patents_udpipe.Rdata") # raw
+
+load("~/Documents/R/verb_object_pairs_patents_NEW.Rdata") # PROCESSED WITH WORDNET
+
+stop = data.frame(word = stopwords(language = 'en'))
+
+setDict("~/Documents/R/dict/")
+
+
+tasks_us <- read_excel("~/Documents/R/Task Statements.xlsx") %>% 
+  transform(id = as.numeric(factor(Title))) %>% 
+  select(-'Task.Type', -'Incumbents.Responding', -'Date', -`Domain.Source`, -'Task.ID')
+tasks_us_unique = unique(tasks_us$Title) %>% as.data.frame()
+
+```
+
+# UDPipe initialisation
+
+```{r message=FALSE, warning=FALSE}
+ud_model <- udpipe_download_model(language = "english")
+ud_model <- udpipe_load_model(ud_model$file_model)
+```
+
+
+# US Preprocessing
+
+## Annot + pair creation
+
+```{r}
+# Annotate jobs with UDPipe 
+tasks_us_udpipe <- udpipe_annotate(ud_model, x = tasks_us$Task)
+tasks_us_udpipe <- as.data.frame(tasks_us_udpipe)
+
+# Join datasets
+tasks_us_udpipe = tasks_us %>% 
+  left_join(tasks_us_udpipe, by = c("Task" = "sentence"))
+
+# Filter for verbs
+verbs_us <- tasks_us_udpipe %>% filter(upos == "VERB") %>% 
+  rename(verb_id = token_id, verb = lemma)
+
+# Filter for direct objects
+direct_objects_us <- tasks_us_udpipe %>% filter(dep_rel == "obj") %>% 
+  rename(object_id = token_id, object = lemma)
+
+# Join verbs and direct objects based on sentence_id and head_token_id to get verb-object pairs
+verb_object_pairs_us <- verbs_us %>%
+  inner_join(direct_objects_us, by = c("id", 'doc_id', "sentence_id", "verb_id" = "head_token_id"))
+
+verb_object_pairs_FINAL_us = verb_object_pairs_us %>% 
+  select("id", 'doc_id', "verb", "object")
+
+verb_object_pairs_FINAL_us$pair = 
+  paste(trimws(verb_object_pairs_FINAL_us$verb), trimws(verb_object_pairs_FINAL_us$object))
+
+```
+
+
+## Fig 4: VN pairs US O*NET
+
+```{r}
+
+verb_object_pairs_FINAL_us %>%
+  count(pair) %>% 
+  arrange(-n) %>% 
+  head(20) %>% 
+  ggplot() +
+  geom_col(
+    aes(
+      x = fct_reorder(pair, n), y = n, fill = n
+    )) +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = 'Figure 4. Most Common Verb-Noun Pairs in US Job Tasks',
+    x = 'Pair',
+    y = 'Count',
+    fill = 'Count',
+    caption = "O*NET Databse, United States Department of Labor,\n Author's Calculations"
+  ) +
+  scale_fill_continuous() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.caption = element_text(hjust = 1)
+  )
+```
+
+## Fig 3: US LEMM
+
+```{r}
+
+tasks_us_udpipe %>%
+  mutate(lemma = str_remove_all(lemma,  "[[:punct:]]")) %>%
+  mutate(lemma = str_trim(lemma)) %>%
+  mutate(lemma = str_remove_all(lemma, "\\s+")) %>% 
+  filter(lemma != "" & lemma != " " & lemma != 's' & lemma != 'eg') %>%
+  mutate(lemma = str_to_lower(lemma)) %>% 
+  anti_join(stop, by = c("lemma" = "word")) %>% 
+  count(lemma) %>% 
+  arrange(-n) %>% 
+  head(20) %>% 
+  ggplot() +
+  geom_col(
+    aes(x = fct_reorder(lemma, n), y = n, fill = n)
+  ) +
+  labs(
+    x = "Lemma",
+    y = "Count",
+    title = "Figure 3. Frequency of Lemmas in US Job Tasks",
+    caption = "Source: O*NET Databse, United States Department of Labor,\n Author's Calculations",
+    fill = "Count"
+  ) +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.caption = element_text(hjust = 1)
+  ) +
+  scale_fill_continuous()
+```
+
+
+# Funtion dep pars (fig 2)
+
+```{r}
+
+plot_annotation <- function(x, size = 3){
+  stopifnot(is.data.frame(x) & all(c("sentence_id", "token_id", "head_token_id", "dep_rel",
+                                     "token_id", "token", "lemma", "upos", "xpos", "feats") %in% colnames(x)))
+  x <- x[!is.na(x$head_token_id), ]
+  x <- x[x$sentence_id %in% min(x$sentence_id), ]
+  edges <- x[x$head_token_id != 0, c("token_id", "head_token_id", "dep_rel")]
+  edges$label <- edges$dep_rel
+  g <- graph_from_data_frame(edges,
+                             vertices = x[, c("token_id", "token", "lemma", "upos", "xpos", "feats")],
+                             directed = TRUE)
+  ggraph(g, layout = "linear") +
+    geom_edge_arc(ggplot2::aes(label = dep_rel, vjust = -0.20),
+                  arrow = grid::arrow(length = unit(4, 'mm'), ends = "last", type = "closed"),
+                  end_cap = ggraph::label_rect("wordswordswords"),
+                  label_colour = "red", check_overlap = TRUE, label_size = size) +
+    geom_node_label(ggplot2::aes(label = token), col = "darkgreen", size = size, fontface = "bold") +
+    geom_node_text(ggplot2::aes(label = upos), nudge_y = -0.35, size = size) +
+    theme_graph(base_family = "Arial Narrow") +
+    labs(title = "Figure 2. Udpipe output", subtitle = "Tokenisation, POS tagging & dependency relations")
+}
+```
+
+
+# Patents US
+
+## bigQuery (depricated)
+
+```{r}
+
+# projectid = "thesis-386309"
+# sql <- "SELECT * FROM `patents_us.final_table`"
+# tb <- bq_project_query(projectid, sql)
+# 
+# pat_ai <-bq_table_download(tb)
+# 
+# pat_ai_sample = sample_n(pat_ai, 400000)
+
+
+# patents_udpipe <- udpipe_annotate(ud_model, x = pat_ai_sample$text)
+# patents_udpipe <- as.data.frame(patents_udpipe)
+```
+
+
+
+
+```{r}
+# patents_udpipe = patents_udpipe %>% 
+#   anti_join(stop, by = c("lemma" = "word"))
+# 
+# # Filter for verbs
+# verbs_patents <- patents_udpipe %>% filter(upos == "VERB") %>% 
+#   rename(verb_id = token_id, verb = lemma)
+# 
+# # Filter for direct objects
+# direct_objects_patents <- patents_udpipe %>% filter(dep_rel == "obj") %>% 
+#   rename(object_id = token_id, object = lemma)
+# 
+# # Join verbs and direct objects based on sentence_id and head_token_id to get verb-object pairs
+# verb_object_pairs_patents <- verbs_patents %>%
+#   inner_join(direct_objects_patents, by = c('doc_id', "sentence_id", "verb_id" = "head_token_id"))
+# 
+# 
+# verb_object_pairs_FINAL_patents = verb_object_pairs_patents %>% 
+#   select('doc_id', "verb", "object")
+# 
+# #remove trash
+# verb_object_pairs_FINAL_patents$verb = str_remove_all(verb_object_pairs_FINAL_patents$verb, "-")
+# verb_object_pairs_FINAL_patents$object = str_remove_all(verb_object_pairs_FINAL_patents$object, "-")
+# 
+# #lemmatise
+# verb_object_pairs_FINAL_patents$verb <- lemmatize_words(verb_object_pairs_FINAL_patents$verb, dictionary = lexicon::hash_lemmas)
+# verb_object_pairs_FINAL_patents$object <- lemmatize_words(verb_object_pairs_FINAL_patents$object, dictionary = lexicon::hash_lemmas)
+# 
+# # paste a pair and trim ws
+# verb_object_pairs_FINAL_patents$pair = 
+#   paste(trimws(verb_object_pairs_FINAL_patents$verb), trimws(verb_object_pairs_FINAL_patents$object))
+# 
+# 
+# verb_object_pairs_FINAL_patents$doc_id = as.factor(verb_object_pairs_FINAL_patents$doc_id)
+```
+
+# Figure 5 VN pairs patents
+
+```{r}
+verb_object_pairs_FINAL_patents %>% 
+  count(pair) %>% 
+  arrange(-n) %>% 
+  head(20) %>% ggplot() + geom_col(
+    aes(x = fct_reorder(pair, n), y = n, fill = n)
+  ) +
+  labs(
+    x = "Verb-Noun (VN) Patent Pair",
+    y = "Count",
+    title = "Figure 5. Most Common Verb-Noun Pairs in US Patents",
+    caption = "Source: Google Patents Public Data, USPTO,\n Author's Calculations",
+    fill = 'Count'
+  ) +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.caption = element_text(hjust = 1)
+  ) +
+  scale_fill_continuous()
+```
+
+
+# WordNet FUN and patent nouns
+
+
+```{r}
+# Define the function
+# get_synset <- function(word) {
+#   filter <- getTermFilter(type="ExactMatchFilter", word=word, ignoreCase=TRUE)
+#   terms <- getIndexTerms("NOUN", 5, filter)
+#   if(length(terms) > 0) {
+#     synsets <- getSynsets(terms[[1]])
+#     if(length(synsets) > 0) {
+#       related <- getRelatedSynsets(synsets[[1]], "@")
+#       if(length(related) > 0) {
+#         return(sapply(related, getWord)[1])
+#       }
+#     }
+#   }
+#   return(NA)  # return NA if no synset is found
+# }
+# 
+# # Apply the function to a column with progress bar
+# my_list <- pblapply(unique(verb_object_pairs_FINAL_patents$object), get_synset)
+# 
+# list_nouns = c()
+# for (i in 1:length(my_list)) {
+#   list_nouns <- c(list_nouns, my_list[[i]][[1]][1])
+# }
+# 
+# patent_noun_onto = data.frame(noun =list_nouns)
+# patent_noun_onto$old_noun = unique(verb_object_pairs_FINAL_patents$object)
+# 
+# 
+# VN_FINAL_patents = verb_object_pairs_FINAL_patents %>% left_join(patent_noun_onto,
+#                                                                  by = c('object' = 'old_noun'))
+# 
+# VN_FINAL_patents$pair = 
+#   paste(trimws(VN_FINAL_patents$verb), trimws(VN_FINAL_patents$noun))
+
+
+
+pair_freq <- table(verb_object_pairs_patents_NEW$pair)
+
+# Convert to data frame
+pair_freq_df <- as.data.frame(pair_freq)
+
+# Rename columns
+names(pair_freq_df) <- c("pair", "frequency")
+
+# Calculate relative frequencies
+pair_freq_df$relative_frequency <- pair_freq_df$frequency / sum(pair_freq_df$frequency)
+
+```
+
+
+# DE Tasks Analysis
+
+```{r}
+# read
+de_tasks <- read_excel("~/Documents/R/de_tasks_translated.xlsx") 
+
+#trasform the original
+de_tasks = de_tasks %>%
+  select(-Aufgabe) %>% 
+  mutate(Title =str_to_sentence(Title)) %>% 
+  transform(id = as.numeric(factor(Title))) %>% 
+  mutate(Task = str_split(Task, "\n")) %>%
+  unnest(Task) %>%
+  filter(Task != "" & Task != " " & nchar(Task) > 2) %>%
+  mutate(Task = trimws(Task)) %>% 
+  mutate(Task = str_to_sentence(Task))
+  
+
+#use the same udpipe
+de_tasks_udpipe <- udpipe_annotate(ud_model, x = de_tasks$Task)
+de_tasks_udpipe <- as.data.frame(de_tasks_udpipe)
+
+de_tasks_udpipe = de_tasks %>% 
+  left_join(de_tasks_udpipe, by = c("Task" = "sentence"))
+
+# Filter for verbs
+verbs_de <- de_tasks_udpipe %>% filter(upos == "VERB") %>% 
+  rename(verb_id = token_id, verb = lemma)
+
+# Filter for direct objects
+direct_objects_de <- de_tasks_udpipe %>% filter(dep_rel == "obj") %>% 
+  rename(object_id = token_id, object = lemma)
+
+# Join verbs and direct objects based on sentence_id and head_token_id to get verb-object pairs
+verb_object_pairs_de <- verbs_de %>%
+  inner_join(direct_objects_de, by = c("id", 'doc_id', "sentence_id", "verb_id" = "head_token_id"))
+
+verb_object_pairs_FINAL_de = verb_object_pairs_de %>% 
+  select("id", 'doc_id', "verb", "object") %>% 
+  mutate(verb = str_to_lower(verb)) %>% 
+  mutate(object = str_to_lower(object)) %>% 
+  mutate(pair = paste(trimws(verb_object_pairs_de$verb), trimws(verb_object_pairs_de$object)))
+
+
+
+
+
+my_list_de <- pblapply(unique(verb_object_pairs_FINAL_de$object), get_synset)
+
+list_nouns_de = c()
+for (i in 1:length(my_list_de)) {
+  list_nouns_de <- c(list_nouns_de, my_list_de[[i]][[1]][1])
+}
+
+patent_noun_onto_de = data.frame(noun =list_nouns_de)
+patent_noun_onto_de$old_noun = unique(verb_object_pairs_FINAL_de$object)
+
+
+verb_object_pairs_FINAL_de = verb_object_pairs_FINAL_de %>% left_join(patent_noun_onto_de,
+                                                                 by = c('object' = 'old_noun'))
+
+verb_object_pairs_FINAL_de$pair =  
+  paste(trimws(verb_object_pairs_FINAL_de$verb), trimws(verb_object_pairs_FINAL_de$noun))
+
+
+final_de = verb_object_pairs_FINAL_de %>% 
+  left_join(pair_freq_df, by = 'pair')
+
+de_tasks_final = de_tasks %>% 
+  left_join(final_de, by = 'id')
+
+de_tasks_final = 
+  de_tasks_final %>% group_by(Title) %>% mutate(mean_automation = mean(relative_frequency, na.rm = T))
+  
+```
+
+
+# US tasks
+
+```{r}
+my_list_us <- pblapply(unique(verb_object_pairs_FINAL_us$object), get_synset)
+
+list_nouns_us = c()
+for (i in 1:length(my_list_us)) {
+  list_nouns_us <- c(list_nouns_us, my_list_us[[i]][[1]][1])
+}
+
+patent_noun_onto_us = data.frame(noun =list_nouns_us)
+patent_noun_onto_us$old_noun = unique(verb_object_pairs_FINAL_us$object)
+
+
+verb_object_pairs_FINAL_us = verb_object_pairs_FINAL_us %>% left_join(patent_noun_onto_us,
+                                                                 by = c('object' = 'old_noun'))
+
+verb_object_pairs_FINAL_us$pair =  
+  paste(trimws(verb_object_pairs_FINAL_us$verb), trimws(verb_object_pairs_FINAL_us$noun))
+
+
+final_us = verb_object_pairs_FINAL_us %>% 
+  left_join(pair_freq_df, by = 'pair')
+
+us_tasks_final = tasks_us %>% 
+  left_join(final_us, by = 'id') %>% group_by(Title) %>% mutate(mean_automation = mean(relative_frequency, na.rm = T))
+
+```
+
+```{r}
+a = us_tasks_final$mean_automation * 100
+b = de_tasks_final$mean_automation * 100
+
+
+t.test(a,b)
+
+
+```
+
+
+# Fig 7+8 (lem / VN de)
+
+```{r}
+
+de_tasks_udpipe %>% 
+  mutate(lemma = str_remove_all(lemma,  "[[:punct:]]")) %>%
+  mutate(lemma = str_trim(lemma)) %>%
+  mutate(lemma = str_remove_all(lemma, "\\s+")) %>% 
+  filter(lemma != "" & lemma != " " & lemma != 's' & lemma != 'eg') %>%
+  mutate(lemma = str_to_lower(lemma)) %>% 
+  anti_join(stop, by = c("lemma" = "word")) %>% 
+  count(lemma) %>% 
+  arrange(-n) %>% 
+  head(20) %>%
+  ggplot() +
+  geom_col(
+    aes(x = fct_reorder(lemma, n), y = n, fill = n)
+  ) +
+  labs(
+    x = "Lemma",
+    y = "Count",
+    title = "Figure 7. Frequency of Lemmas in German Job Tasks",
+    caption = "Source: Bundesagentur für Arbeit, Author's Calculations",
+    fill = "Count"
+  ) +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.caption = element_text(hjust = 1)
+  ) +
+  scale_fill_continuous()
+
+
+verb_object_pairs_FINAL_de %>% 
+  count(pair) %>% 
+  arrange(-n) %>% 
+  head(20) %>% 
+  ggplot() +
+  geom_col(
+    aes(
+      x = fct_reorder(pair, n), y = n, fill = n
+    )) +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = 'Figure 8. Most Common Verb-Noun Pairs in German Job Tasks',
+    x = 'Pair',
+    y = 'Count',
+    fill = 'Count',
+    caption = "Source: Bundesagentur für Arbeit, Author's Calculations"
+  ) +
+  scale_fill_continuous() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.caption = element_text(hjust = 1)
+  )
+```
+
